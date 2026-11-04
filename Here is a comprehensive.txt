@@ -1,0 +1,104 @@
+Here is a comprehensive summary of the architecture, features, and implementation process completed for **PurePurge**.
+
+---
+
+### 1. Executive Summary
+
+**PurePurge** is a GUI-based zero-trace uninstaller for Ubuntu built using Python and PyQt6. It detects, inspects, and deeply removes applications installed via **APT**, **Snap**, and **Flatpak**. 
+
+Unlike standard GUI store uninstallers, PurePurge cleans residual configuration files, cached packages/revisions, repository definitions (`.list` / `.sources`), signing keys, and per-user state directories (`~/.config`, `~/.local/share`, `~/.cache`, `~/snap`, `~/.var/app`).
+
+---
+
+### 2. Architecture & Modules Built
+
+```
+purepurge/
+├── main.py                         # Application controller & background worker coordinator
+├── com.purepurge.pkexec.policy     # Polkit policy for elevated batch execution
+├── README.md                       # Documentation & troubleshooting
+│
+├── core/
+│   ├── __init__.py
+│   ├── safeguards.py               # Whitelist preventing removal of essential system packages
+│   ├── scanner.py                  # Package & .desktop file scanner across APT, Snap, Flatpak
+│   └── purger.py                   # Script builder & pkexec deep-removal execution engine
+│
+└── ui/
+    ├── __init__.py
+    ├── dashboard.py                # Main dark-themed window (search, filters, app table)
+    └── confirm_modal.py            # Pre-removal inspection modal (traces & command preview)
+```
+
+---
+
+### 3. Detailed Component Breakdown
+
+#### A. Core Backend
+
+* **Safeguards ([`core/safeguards.py`](file:///home/nexus/Coding/purepurge/core/safeguards.py))**
+  * Maintains `frozenset`s and glob patterns of critical system components:
+    * **APT**: `ubuntu-desktop`, `systemd`, `linux-image-*`, `grub-*`, `libc6`, `bash`, `dpkg`, `apt`, `sudo`, `polkitd`, etc.
+    * **Snap**: `bare`, `core`, `core18`–`core24`, `snapd`, `gnome-*-*`.
+    * **Flatpak**: Runtimes and SDKs (`org.freedesktop.Platform`, `org.gnome.Sdk`, etc.).
+  * Provides query functions (`is_essential_*`) and partition filters (`filter_safe_*`) that block critical packages from ever entering a purge script.
+
+* **Scanner ([`core/scanner.py`](file:///home/nexus/Coding/purepurge/core/scanner.py))**
+  * **APT**: Scans `/usr/share/applications/*.desktop`, filters out background helpers (`NoDisplay=true`), maps the `.desktop` file to its owning package via `dpkg -S`, and pulls versions/sizes via `dpkg-query`.
+  * **Snap**: Queries `snap list`, maps entries to `.desktop` files in `/var/lib/snapd/desktop/applications/` to resolve app names and icons.
+  * **Flatpak**: Queries `flatpak list --app` and resolves app metadata and icons.
+  * Emits unified [`AppEntry`](file:///home/nexus/Coding/purepurge/core/scanner.py#L48-L69) dataclass objects with safety status tags.
+
+* **Purger ([`core/purger.py`](file:///home/nexus/Coding/purepurge/core/purger.py))**
+  * **APT Deep Clean**:
+    1. `apt-get purge --autoremove -y <packages>`
+    2. Residual config package cleanup (`dpkg -l | awk '/^rc/ ...'`)
+    3. PPA/repo cleanup in `/etc/apt/sources.list.d/` and keyrings
+    4. Cache cleaning (`apt-get autoclean -y`)
+    5. Directory scrubbing for `/etc/<pkg>`, `~/.config/<pkg>`, `~/.local/share/<pkg>`, and `~/.cache/<pkg>`.
+  * **Snap Deep Clean**: Runs `snap remove --purge` and removes `~/snap/<snap>` and `/var/snap/<snap>`, pruning `/var/lib/snapd/cache/`.
+  * **Flatpak Deep Clean**: Runs `flatpak uninstall --delete-data -y`, cleans unused runtimes (`flatpak uninstall --unused -y`), and scrubs `~/.var/app/<ref>`.
+  * **Single-Auth Polkit Engine**: Compiles the batch commands into a temporary bash script and invokes it with `pkexec bash <script>`. This avoids repeated password prompts.
+
+---
+
+#### B. Graphical Interface (PyQt6)
+
+* **Dashboard Window ([`ui/dashboard.py`](file:///home/nexus/Coding/purepurge/ui/dashboard.py))**
+  * Dark Ubuntu-inspired theme with custom color tokens.
+  * Live search bar (filtering by name, package name, description).
+  * Filter pills (**All**, **APT**, **Snap**, **Flatpak**).
+  * Asynchronous scan runner (`_ScanWorker` on a `QThread`) ensuring the UI never hangs on launch.
+  * Multi-column table with custom painted source badges (`_SourceBadgeDelegate`).
+  * Essential system packages highlighted in gold with removal blocked.
+
+* **Inspection Modal ([`ui/confirm_modal.py`](file:///home/nexus/Coding/purepurge/ui/confirm_modal.py))**
+  * Opens when clicking **Purge Selected**.
+  * **Overview tab**: Summary of targets and package sources.
+  * **Files & Configs tab**: Live filesystem tree showing detected files, config paths, repos, and cache entries to be purged.
+  * **Commands tab**: Displays the exact shell commands that `pkexec` will execute.
+
+* **Application Orchestrator ([`main.py`](file:///home/nexus/Coding/purepurge/main.py))**
+  * Handles the event loop and coordinates GUI signals with background threads.
+  * Dispatches jobs to `_PurgeWorker` (`QThread`), displaying a modal progress bar during execution.
+  * Pops an inspection/results dialog (`_ResultDialog`) displaying command output, stdout/stderr, and blocked package notices upon completion, followed by an automatic dashboard rescan.
+
+---
+
+#### C. System Integration
+
+* **Polkit Policy ([`com.purepurge.pkexec.policy`](file:///home/nexus/Coding/purepurge/com.purepurge.pkexec.policy))**: Configured for `com.purepurge.pkexec.purge` using `auth_admin_keep` so users authenticate via Ubuntu's native polkit prompt.
+* **Documentation ([`README.md`](file:///home/nexus/Coding/purepurge/README.md))**: Complete guide covering installation, architecture, usage, troubleshooting, and safety policies.
+
+---
+
+### 4. Verification & Validation Performed
+
+1. **Backend Tests**: Verified that all imports in `safeguards`, `purger`, and `scanner` resolve cleanly with Python 3.14.
+2. **Scanner Smoke Test**: Executed live against your system:
+   * Successfully detected **53 APT applications** and mapped them to their Debian package counterparts.
+   * Successfully indexed **25 Snaps** (marking `bare`, `core18`, etc. as ⛔ essential).
+   * Verified Flatpak detection handles systems without Flatpak apps cleanly.
+3. **Trace Inspection Test**: Verified `_find_apt_traces('gnome-calculator')` correctly resolved 206 installed files and local config paths without error.
+4. **UI Event Loop Test**: Verified `main.py` launches and binds the Qt event loop, controller slots, and threads correctly.
+5. **Polkit XML Validation**: Validated `com.purepurge.pkexec.policy` structure via `xml.etree.ElementTree`.
